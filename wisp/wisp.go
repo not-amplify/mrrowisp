@@ -41,6 +41,7 @@ type Config struct {
 	CertAuthRequired     bool
 	CertAuthPublicKeys   []ed25519.PublicKey
 	EnableStreamConfirm  bool
+	MaxConnectsPerSecond int
 
 	DNSCache    *DNSCache
 	ReadBufPool sync.Pool
@@ -107,11 +108,12 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 		}
 
 		wc := &wispConnection{
-			netConn:      netConn,
-			writeCh:      make(chan writeReq, 4096), // funny number
-			config:       config,
-			twispStreams: newTwisp(),
-			isV2:         useV2,
+			netConn:        netConn,
+			writeCh:        make(chan writeReq, 4096), // funny number
+			config:         config,
+			twispStreams:   newTwisp(),
+			isV2:           useV2,
+			connectLimiter: newConnectRateLimiter(config.MaxConnectsPerSecond),
 		}
 
 		go wc.writeLoop()

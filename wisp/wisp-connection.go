@@ -7,8 +7,40 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
+
+const (
+	maxConnectsPerSecond = 20
+	connectRateWindow    = time.Second
+)
+
+type connectRateLimiter struct {
+	mutex       sync.Mutex
+	windowStart time.Time
+	count       int
+	limit       int
+}
+
+func newConnectRateLimiter(limit int) *connectRateLimiter {
+	if limit <= 0 {
+		limit = maxConnectsPerSecond
+	}
+	return &connectRateLimiter{windowStart: time.Now(), limit: limit}
+}
+
+func (r *connectRateLimiter) allow() bool {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	now := time.Now()
+	if now.Sub(r.windowStart) >= connectRateWindow {
+		r.windowStart = now
+		r.count = 0
+	}
+	r.count++
+	return r.count <= r.limit
+}
 
 type writeReq struct {
 	data []byte
@@ -24,6 +56,7 @@ type wispConnection struct {
 	isClosed       atomic.Bool
 	config         *Config
 	twispStreams   *twispRegistry
+	connectLimiter *connectRateLimiter
 
 	isV2          bool
 	handshakeDone chan struct{}
@@ -87,6 +120,11 @@ func (c *wispConnection) handlePacket(packetType uint8, streamId uint32, payload
 }
 
 func (c *wispConnection) handleConnectPacket(streamId uint32, payload []byte) {
+	if !c.connectLimiter.allow() {
+		c.sendClosePacket(streamId, closeReasonThrottled)
+		return
+	}
+
 	if len(payload) < 3 {
 		return
 	}

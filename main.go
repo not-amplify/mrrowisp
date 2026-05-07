@@ -43,6 +43,7 @@ type Config struct {
 	CertAuthRequired     bool              `json:"certAuthRequired"`
 	CertAuthPublicKeys   []string          `json:"certAuthPublicKeys"`
 	EnableStreamConfirm  bool              `json:"enableStreamConfirm"`
+	MaxConnectsPerSecond int               `json:"maxConnectsPerSecond"`
 }
 
 func defaultConfig() Config {
@@ -143,6 +144,7 @@ func createWispConfig(cfg Config) *wisp.Config {
 		CertAuthRequired:           cfg.CertAuthRequired,
 		CertAuthPublicKeys:         pubKeys,
 		EnableStreamConfirm:        cfg.EnableStreamConfirm,
+		MaxConnectsPerSecond:       cfg.MaxConnectsPerSecond,
 	}
 
 	if wispCfg.PasswordUsers == nil {
