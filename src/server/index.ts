@@ -1,7 +1,10 @@
 import { spawn, type ChildProcess } from "child_process";
 import * as fs from "fs";
+import * as net from "net";
+import { WebSocketServer, WebSocket } from "ws";
 import { wispConfigPath, wispPath } from "../path.js";
-import type { Config, WispBuilder, WispEvents, WispServer } from "../types.js";
+import type { Config, WispBuilder, WispEvents, WispServer, RouteRequest } from "../types.js";
+import type { IncomingMessage } from "http";
 
 type EventListeners = {
 	[E in keyof WispEvents]: Array<WispEvents[E]>;
@@ -153,6 +156,49 @@ class WispBuilderImpl implements WispBuilder {
 	dns(servers: string | string[]): WispBuilder {
 		this.config.dnsServer = Array.isArray(servers) ? servers : [servers];
 		return this;
+	}
+
+	route(req: IncomingMessage, socket: net.Socket, head: Buffer): void {
+		const port = this.config.port ?? 8080;
+		const wss = new WebSocketServer({ noServer: true });
+
+		wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {
+			const client = new WebSocket(`ws://localhost:${port}`);
+
+			client.on("open", () => {
+				ws.on("message", (data: Buffer) => {
+					if (client.readyState === WebSocket.OPEN) {
+						client.send(data);
+					}
+				});
+
+				ws.on("close", () => {
+					client.close();
+				});
+
+				ws.on("error", () => {
+					client.close();
+				});
+			});
+
+			client.on("message", (data: Buffer) => {
+				if (ws.readyState === ws.OPEN) {
+					ws.send(data);
+				}
+			});
+
+			client.on("close", () => {
+				ws.close();
+			});
+
+			client.on("error", (err) => {
+				ws.close(1011, err.message);
+			});
+		});
+
+		socket.on("error", () => {
+			wss.close();
+		});
 	}
 
 	onReady(callback: () => void): WispBuilder {

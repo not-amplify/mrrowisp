@@ -61,6 +61,7 @@ export type WispBuilder = {
 	whitelist(hostnames: string[]): WispBuilder;
 	proxy(url: string): WispBuilder;
 	dns(servers: string | string[]): WispBuilder;
+	route(req: IncomingMessage, socket: Socket, head: Buffer): void;
 	onReady(callback: () => void): WispBuilder;
 	onError(callback: (error: Error) => void): WispBuilder;
 	onExit(callback: (code: number | null, signal: NodeJS.Signals | null) => void): WispBuilder;
@@ -68,4 +69,8 @@ export type WispBuilder = {
 	onStderr(callback: (data: string) => void): WispBuilder;
 	getConfig(): Config;
 	start(): Promise<WispServer>;
+};
+
+export type RouteRequest = {
+	(req: IncomingMessage, socket: Socket, head: Buffer): void;
 };
