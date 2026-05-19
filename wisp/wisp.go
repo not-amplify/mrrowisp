@@ -127,6 +127,7 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 			isV2:           useV2,
 			connectLimiter: newConnectRateLimiter(config.MaxConnectsPerSecond),
 		}
+		wc.initWriteLifecycle()
 
 		go wc.writeLoop()
 

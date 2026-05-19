@@ -62,6 +62,13 @@ type wispConnection struct {
 	handshakeDone chan struct{}
 	streamConfirm bool
 	v2Challenge   []byte
+
+	writeDone chan struct{}
+	writeOnce sync.Once
+}
+
+func (c *wispConnection) initWriteLifecycle() {
+	c.writeDone = make(chan struct{})
 }
 
 func (c *wispConnection) close() {
@@ -72,17 +79,28 @@ func (c *wispConnection) close() {
 }
 
 func (c *wispConnection) writeLoop() {
-	for req := range c.writeCh {
-		bufs := net.Buffers{req.data}
-		n := len(c.writeCh)
-		for i := 0; i < n; i++ {
-			r := <-c.writeCh
-			bufs = append(bufs, r.data)
-		}
-		if _, err := bufs.WriteTo(c.netConn); err != nil {
-			c.isClosed.Store(true)
-			c.netConn.Close()
+	for {
+		select {
+		case <-c.writeDone:
 			return
+		case req, ok := <-c.writeCh:
+			if !ok {
+				return
+			}
+			bufs := net.Buffers{req.data}
+			n := len(c.writeCh)
+			for i := 0; i < n; i++ {
+				r, ok := <-c.writeCh
+				if !ok {
+					break
+				}
+				bufs = append(bufs, r.data)
+			}
+			if _, err := bufs.WriteTo(c.netConn); err != nil {
+				c.isClosed.Store(true)
+				c.netConn.Close()
+				return
+			}
 		}
 	}
 }
@@ -91,10 +109,21 @@ func (c *wispConnection) queueWrite(data []byte) {
 	if c.isClosed.Load() {
 		return
 	}
-	defer func() {
-		recover()
-	}()
-	c.writeCh <- writeReq{data: data}
+	if c.writeDone == nil {
+		// Lifecycle wasn't initialized (legacy code path); fall back to a
+		// best-effort send protected by recover.
+		defer func() { recover() }()
+		c.writeCh <- writeReq{data: data}
+		return
+	}
+	select {
+	case <-c.writeDone:
+		return
+	case c.writeCh <- writeReq{data: data}:
+	default:
+		// Channel full -> close to avoid deadlock; readers will see EOF.
+		c.close()
+	}
 }
 
 func (c *wispConnection) handlePacket(packetType uint8, streamId uint32, payload []byte) {
@@ -295,6 +324,12 @@ func (c *wispConnection) deleteAllWispStreams() {
 		}
 		c.twispStreams.mu.RUnlock()
 	}
-	defer func() { recover() }()
-	close(c.writeCh)
+	c.writeOnce.Do(func() {
+		if c.writeDone != nil {
+			close(c.writeDone)
+		}
+		// Intentionally do NOT close c.writeCh: concurrent senders in
+		// queueWrite would race with the close. They observe writeDone and
+		// exit; the channel becomes garbage once references drop.
+	})
 }
