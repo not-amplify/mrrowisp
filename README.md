@@ -236,6 +236,19 @@ Copy `example.config.json` to `config.json` and edit as needed:
 | `certAuthPublicKeys`         | []string | Allowed Ed25519 public keys (hex-encoded)     |
 | `enableStreamConfirm`        | bool     | Send confirmation when streams connect        |
 
+### Flood protection & egress
+
+To prevent the server from being abused as a TCP SYN flood relay (see OVH abuse reports the maintainers received), this build adds:
+
+- **SSRF defense:** `allowDirectIP` now refuses CONNECTs to IP-literal hostnames; `allowPrivateIPs` and `allowLoopbackIPs` reject CONNECTs whose resolved IP is in private/loopback/link-local/multicast ranges. The DNS resolution loop walks all returned addresses and picks the first allowed one, so DNS responses can't bypass the policy by interleaving private and public IPs.
+- **Per-source / per-destination rate limits:** sliding-window limiters on source IP, destination IP:port (sec + min). Defaults: 50/sec/source, 8/sec/dest, 60/min/dest. Tune via `floodProtection`.
+- **In-flight SYN cap:** counting semaphore around outbound TCP dials.
+- **SYN-flood signature detector:** per-(WS, dst) ring buffer of dial outcomes. When ≥`minSamples` attempts in `windowMs` exceed `failedHandshakeRatio` failed-handshake fraction, the WS is closed.
+- **Reputation store:** persists 0–100 scores per source IP and per destination IP:port to `reputation.storePath` via atomic-rename. Bad behavior (egress violations, SYN signatures, twisp-without-auth, repeated burst-rate hits) raises the score; long-lived successful streams lower it. When a destination's score reaches the strict threshold (default 81) — which happens when many distinct sources hit it — new CONNECTs to that destination are refused. This is the defense against the popular-website-script attack pattern where many residential IPs each look innocent on their own but collectively target one victim.
+- **Trusted proxy support:** `parseRealIP: true` plus `trustedProxies` (CIDRs) plus `trustedHeaders` (default: CF-Connecting-IP, X-Forwarded-For). Headers are honored only when the immediate peer is in `trustedProxies`.
+- **Twisp now requires auth:** with `enableTwisp: true`, you must also enable `passwordAuth` and the client must pass the v2 auth handshake. Anonymous twisp on v1 is refused. `passwordUsers` may contain bcrypt hashes (prefix `$2a$`/`$2b$`/`$2y$`); plaintext is deprecated and logs a warning on first use.
+- **Structured logging:** every block emits a Logger.Warn line — fail2ban-friendly. Example regex: `"flood block".*"ip", "<HOST>"`.
+
 ## Credits
  - [soap phia](https://github.com/soap-phia/) - writing most of this
  - [rebecca](https://github.com/rebeccaheartz69/) - greatly helping with implementing wisp v2 and extensions

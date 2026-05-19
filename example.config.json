@@ -40,7 +40,8 @@
 	"connectionsLimitPerIP": 20,
 	"connectionWindowSeconds": 10,
 	"parseRealIP": true,
-	"parseRealIPFrom": ["127.0.0.1"],
+	"trustedProxies": ["127.0.0.1"],
+	"trustedHeaders": ["CF-Connecting-IP", "X-Forwarded-For"],
 	"maxMessageSize": 0,
 	"staticDir": "",
 	"nonWSResponse": "mrrow merp >w<",
@@ -59,5 +60,43 @@
 	"maxConnectionsPerIP": 0,
 	"globalMaxConnections": 0,
 	"writeQueueSize": 4096,
-	"maxInboundBytesPerSecond": 0
+	"maxInboundBytesPerSecond": 0,
+	"floodProtection": {
+		"enabled": true,
+		"maxConnectsPerSourceIPPerSecond": 50,
+		"maxConnectsPerDestPerSecond": 8,
+		"maxConnectsPerDestPerMinute": 60,
+		"maxInFlightSyns": 256,
+		"maxConcurrentStreamsPerConnection": 256,
+		"maxConcurrentConnections": 1024,
+		"synFloodSignature": {
+			"enabled": true,
+			"windowMs": 2000,
+			"minSamples": 32,
+			"failedHandshakeRatio": 0.75
+		},
+		"wsCloseAfterViolations": 16,
+		"logBlockedDials": true
+	},
+	"reputation": {
+		"enabled": true,
+		"storePath": "./data/mrrowisp-reputation.json",
+		"saveIntervalSeconds": 30,
+		"scoreDecayPerHour": 1,
+		"evictAfterDays": 7,
+		"thresholds": { "warn": 21, "throttle": 51, "strict": 81 },
+		"weights": {
+			"privateEgress": 15,
+			"synSignature": 25,
+			"twispNoAuth": 40,
+			"burstRate": 5,
+			"successfulStream": -2,
+			"requestKnownBadDest": 2
+		},
+		"destinationWeights": {
+			"privateEgress": 20,
+			"synSignature": 30,
+			"distinctSourcesEscalation": 1
+		}
+	}
 }
