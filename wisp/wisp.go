@@ -50,6 +50,8 @@ type Config struct {
 	TrustedProxies []*net.IPNet
 	TrustedHeaders []string
 
+	Egress *EgressPolicy
+
 	DNSCache    *DNSCache
 	ReadBufPool sync.Pool
 	Dialer      net.Dialer
