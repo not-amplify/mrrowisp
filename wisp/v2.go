@@ -4,9 +4,32 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
+	"log"
+	"strings"
+
+	"golang.org/x/crypto/bcrypt"
 )
+
+// checkPassword compares stored against provided in constant time. If
+// stored begins with a bcrypt prefix ($2a$/$2b$/$2y$), it is verified as a
+// bcrypt hash. Otherwise both values are compared byte-wise with
+// subtle.ConstantTimeCompare; plaintext storage logs a deprecation warning
+// the first time it is observed.
+var plaintextWarned = false
+
+func checkPassword(stored, provided string) bool {
+	if strings.HasPrefix(stored, "$2a$") || strings.HasPrefix(stored, "$2b$") || strings.HasPrefix(stored, "$2y$") {
+		return bcrypt.CompareHashAndPassword([]byte(stored), []byte(provided)) == nil
+	}
+	if !plaintextWarned {
+		plaintextWarned = true
+		log.Println("warning: plaintext passwords in passwordUsers are deprecated; use bcrypt hashes ($2a$/$2b$).")
+	}
+	return subtle.ConstantTimeCompare([]byte(stored), []byte(provided)) == 1
+}
 
 var errorInvalid = errors.New("invalid wisp v2 payload")
 
@@ -167,8 +190,9 @@ func (c *wispConnection) handleInfo(streamId uint32, payload []byte) {
 
 	if c.config.PasswordAuth && clientExts.passwordUsername != "" {
 		expectedPassword, userExists := c.config.PasswordUsers[clientExts.passwordUsername]
-		if userExists && expectedPassword == clientExts.passwordPassword {
+		if userExists && checkPassword(expectedPassword, clientExts.passwordPassword) {
 			authPassed = true
+			c.authPassedFlag.Store(true)
 		} else {
 			c.sendClosePacket(0, closeReasonAuthBadPassword)
 			c.close()
@@ -179,6 +203,7 @@ func (c *wispConnection) handleInfo(streamId uint32, payload []byte) {
 	if c.config.CertAuth && len(clientExts.certificateSig) > 0 && c.v2Challenge != nil {
 		if c.verifyCertificate(clientExts) {
 			authPassed = true
+			c.authPassedFlag.Store(true)
 		} else {
 			c.sendClosePacket(0, closeReasonAuthBadSignature)
 			c.close()
