@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lxzan/gws"
@@ -46,12 +47,55 @@ func (cfg *Config) InitResolver() {
 	}
 }
 
+// BuildGlobals constructs the process-wide enforcement state from cfg.
+// Idempotent: an already-built cfg.Globals is left as-is.
+func (cfg *Config) BuildGlobals() {
+	if cfg.Globals != nil {
+		return
+	}
+	g := &Globals{Egress: PolicyFromConfig(cfg)}
+	if cfg.FloodProtection != nil && cfg.FloodProtection.Enabled {
+		fp := cfg.FloodProtection
+		if fp.MaxConnectsPerSourceIPPerSecond > 0 {
+			g.PerSource = NewSlidingWindow(fp.MaxConnectsPerSourceIPPerSecond, time.Second)
+		}
+		if fp.MaxConnectsPerDestPerSecond > 0 {
+			g.PerDestSec = NewSlidingWindow(fp.MaxConnectsPerDestPerSecond, time.Second)
+		}
+		if fp.MaxConnectsPerDestPerMinute > 0 {
+			g.PerDestMin = NewSlidingWindow(fp.MaxConnectsPerDestPerMinute, time.Minute)
+		}
+		if fp.MaxInFlightSyns > 0 {
+			g.InFlightSyns = NewSemaphore(fp.MaxInFlightSyns)
+		}
+		if fp.MaxConcurrentConnections > 0 {
+			g.Connections = NewSemaphore(fp.MaxConcurrentConnections)
+		}
+		g.Signature = NewSignatures(SignatureConfig{
+			Enabled:              fp.SynFloodSignature.Enabled,
+			Window:               time.Duration(fp.SynFloodSignature.WindowMs) * time.Millisecond,
+			MinSamples:           fp.SynFloodSignature.MinSamples,
+			FailedHandshakeRatio: fp.SynFloodSignature.FailedHandshakeRatio,
+		})
+	}
+	if cfg.Reputation != nil && cfg.Reputation.Enabled {
+		rc := *cfg.Reputation
+		if rc.EvictAfter == 0 && rc.EvictDays > 0 {
+			rc.EvictAfter = time.Duration(rc.EvictDays) * 24 * time.Hour
+		}
+		g.Reputation = NewReputation(rc)
+		_ = g.Reputation.Load()
+	}
+	cfg.Globals = g
+}
+
 type upgradeHandler struct {
 	gws.BuiltinEventHandler
 }
 
 func CreateWispHandler(config *Config) http.HandlerFunc {
 	config.InitResolver()
+	config.BuildGlobals()
 
 	readBufSize := 15 + config.TcpBufferSize
 	config.ReadBufPool = &sync.Pool{
@@ -73,10 +117,21 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 	})
 
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Cap concurrent WS connections before upgrade.
+		if config.Globals != nil && config.Globals.Connections != nil {
+			if !config.Globals.Connections.TryAcquire() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+		}
+
 		useV2 := config.EnableV2 && r.Header.Get("Sec-WebSocket-Protocol") != ""
 
 		wsConn, err := upgrader.Upgrade(w, r)
 		if err != nil {
+			if config.Globals != nil && config.Globals.Connections != nil {
+				config.Globals.Connections.Release()
+			}
 			return
 		}
 
@@ -100,6 +155,8 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 			twispStreams: newTwisp(),
 			isV2:         useV2,
 			remoteIP:     remoteIP.String(),
+			globals:      config.Globals,
+			connID:       atomic.AddUint64(&connIDCounter, 1),
 		}
 
 		go wc.writeLoop()

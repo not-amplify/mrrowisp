@@ -20,6 +20,7 @@ type wispStream struct {
 	conn            net.Conn
 	bufferRemaining uint32
 	hostname        string
+	portNum         int
 
 	connReady     chan struct{}
 	connReadyDone atomic.Bool
@@ -101,6 +102,50 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 		}
 	}
 
+	c := s.wispConn
+
+	// Per-destination rate caps.
+	dstKey := net.JoinHostPort(resolvedHostname, port)
+	if c.globals != nil {
+		if c.globals.PerDestSec != nil && !c.globals.PerDestSec.Allow(dstKey) {
+			c.violation("per_dest_sec")
+			c.repAddSource("burstRate")
+			c.repAddDest(resolvedHostname, s.portNum, "burstRate")
+			cfg.Logger.Warn("flood block", "reason", "per_dest_sec", "ip", c.remoteIP, "dstIP", resolvedHostname, "port", port)
+			s.close(closeReasonThrottled)
+			return
+		}
+		if c.globals.PerDestMin != nil && !c.globals.PerDestMin.Allow(dstKey) {
+			c.violation("per_dest_min")
+			cfg.Logger.Warn("flood block", "reason", "per_dest_min", "ip", c.remoteIP, "dstIP", resolvedHostname, "port", port)
+			s.close(closeReasonThrottled)
+			return
+		}
+	}
+
+	// Reputation-strict destination check.
+	if c.globals != nil && c.globals.Reputation != nil {
+		ds := c.globals.Reputation.DestScore(resolvedHostname, s.portNum)
+		if c.globals.Reputation.Tier(ds) == TierStrict {
+			c.repAddSource("requestKnownBadDest")
+			cfg.Logger.Warn("flood block", "reason", "dest_reputation_strict", "ip", c.remoteIP, "dstIP", resolvedHostname, "port", port)
+			s.close(closeReasonBlocked)
+			return
+		}
+	}
+
+	// In-flight SYN cap.
+	synAcquired := false
+	if c.globals != nil && c.globals.InFlightSyns != nil && streamType == streamTypeTCP {
+		if !c.globals.InFlightSyns.TryAcquire() {
+			c.violation("in_flight_syns")
+			cfg.Logger.Warn("flood block", "reason", "in_flight_syns", "ip", c.remoteIP, "dstIP", resolvedHostname, "port", port)
+			s.close(closeReasonThrottled)
+			return
+		}
+		synAcquired = true
+	}
+
 	s.streamType = streamType
 	s.bufferRemaining = cfg.BufferRemainingLength
 
@@ -125,13 +170,41 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 		}
 	case streamTypeUDP:
 		if cfg.Proxy != "" || !cfg.AllowUDP {
+			if synAcquired {
+				c.globals.InFlightSyns.Release()
+			}
 			s.close(closeReasonBlocked)
 			return
 		}
 		s.conn, err = net.Dial("udp", destination)
 	default:
+		if synAcquired {
+			c.globals.InFlightSyns.Release()
+		}
 		s.close(closeReasonInvalidInfo)
 		return
+	}
+
+	if synAcquired {
+		c.globals.InFlightSyns.Release()
+	}
+
+	// Record dial outcome for SYN-flood signature.
+	if c.globals != nil && c.globals.Signature != nil && streamType == streamTypeTCP {
+		det := c.globals.Signature.For(c.connID, resolvedHostname, s.portNum)
+		det.Record(err == nil)
+		if det.Match() {
+			c.repAddSource("synSignature")
+			c.repAddDest(resolvedHostname, s.portNum, "synSignature")
+			cfg.Logger.Warn("syn-flood signature matched; closing WS",
+				"ip", c.remoteIP, "dstIP", resolvedHostname, "port", port)
+			if err == nil && s.conn != nil {
+				s.conn.Close()
+			}
+			s.close(closeReasonBlocked)
+			c.close()
+			return
+		}
 	}
 
 	if err != nil {

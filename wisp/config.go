@@ -68,10 +68,47 @@ type Config struct {
 
 	BufferRemainingLength uint32 `json:"bufferRemainingLength"`
 
+	FloodProtection *FloodProtectionConfig `json:"floodProtection"`
+	Reputation      *ReputationConfig      `json:"reputation"`
+
 	Logger      Logger
 	DNSCache    *DNSCache
 	ReadBufPool *sync.Pool
 	Dialer      net.Dialer
+	Globals     *Globals
+}
+
+// FloodProtectionConfig groups every flood-mitigation knob.
+type FloodProtectionConfig struct {
+	Enabled                           bool    `json:"enabled"`
+	MaxConnectsPerSourceIPPerSecond   int     `json:"maxConnectsPerSourceIPPerSecond"`
+	MaxConnectsPerDestPerSecond       int     `json:"maxConnectsPerDestPerSecond"`
+	MaxConnectsPerDestPerMinute       int     `json:"maxConnectsPerDestPerMinute"`
+	MaxInFlightSyns                   int     `json:"maxInFlightSyns"`
+	MaxConcurrentStreamsPerConnection int     `json:"maxConcurrentStreamsPerConnection"`
+	MaxConcurrentConnections          int     `json:"maxConcurrentConnections"`
+	SynFloodSignature                 struct {
+		Enabled              bool    `json:"enabled"`
+		WindowMs             int     `json:"windowMs"`
+		MinSamples           int     `json:"minSamples"`
+		FailedHandshakeRatio float64 `json:"failedHandshakeRatio"`
+	} `json:"synFloodSignature"`
+	WsCloseAfterViolations int  `json:"wsCloseAfterViolations"`
+	LogBlockedDials        bool `json:"logBlockedDials"`
+}
+
+// Globals holds process-wide enforcement state injected into wispConnection.
+// Fields may be nil when the corresponding feature is disabled; all methods
+// on the contained types are nil-safe.
+type Globals struct {
+	PerSource    *SlidingWindow
+	PerDestSec   *SlidingWindow
+	PerDestMin   *SlidingWindow
+	InFlightSyns *Semaphore
+	Connections  *Semaphore
+	Egress       *EgressPolicy
+	Reputation   *Reputation
+	Signature    *Signatures
 }
 
 func DefaultConfig() Config {

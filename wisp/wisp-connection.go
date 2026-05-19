@@ -16,6 +16,8 @@ type writeReq struct {
 	pool bool
 }
 
+var connIDCounter uint64
+
 type wispConnection struct {
 	netConn        net.Conn
 	writeCh        chan writeReq
@@ -38,6 +40,10 @@ type wispConnection struct {
 	closeCh     chan struct{}
 	createdAt   time.Time
 	streamCount atomic.Int32
+
+	globals    *Globals
+	connID     uint64
+	violations atomic.Int32
 }
 
 func (c *wispConnection) close() {
@@ -140,20 +146,37 @@ func (c *wispConnection) handleConnectPacket(streamId uint32, payload []byte) {
 	hostname := string(payload[3:])
 
 	c.config.Logger.Debug("creating stream", "ip", c.remoteIP, "streamId", streamId, "hostname", hostname, "port", port, "type", streamType)
-	if streamType == streamTypeTerm {
-		if !c.config.EnableTwisp {
-			c.sendClosePacket(streamId, closeReasonBlocked)
+
+	// Per-connection concurrent-stream cap.
+	if c.config.FloodProtection != nil && c.config.FloodProtection.MaxConcurrentStreamsPerConnection > 0 {
+		if c.streamCount.Load() >= int32(c.config.FloodProtection.MaxConcurrentStreamsPerConnection) {
+			c.violation("per_ws_streams")
+			c.sendClosePacket(streamId, closeReasonThrottled)
 			return
 		}
-		go handleTwisp(c, streamId, hostname)
+	}
+
+	// Per-source-IP rate.
+	if c.globals != nil && c.globals.PerSource != nil && !c.globals.PerSource.Allow(c.remoteIP) {
+		c.violation("per_source_rate")
+		c.repAddSource("burstRate")
+		c.config.Logger.Warn("flood block", "reason", "per_source_rate", "ip", c.remoteIP, "host", hostname, "port", port)
+		c.sendClosePacket(streamId, closeReasonThrottled)
 		return
 	}
 
+	if streamType == streamTypeTerm {
+		c.handleTwispConnect(streamId, hostname)
+		return
+	}
+
+	portNum, _ := strconv.Atoi(port)
 	stream := &wispStream{
 		wispConn:  c,
 		streamId:  streamId,
 		connReady: make(chan struct{}),
 		hostname:  strings.ToLower(strings.TrimSpace(hostname)),
+		portNum:   portNum,
 	}
 	stream.isOpen.Store(true)
 
@@ -164,6 +187,57 @@ func (c *wispConnection) handleConnectPacket(streamId uint32, payload []byte) {
 
 	c.streamCount.Add(1)
 	go stream.handleConnect(streamType, port, hostname)
+}
+
+// handleTwispConnect gates terminal-stream requests. Twisp requires v2,
+// auth configured, and the client to have completed auth.
+func (c *wispConnection) handleTwispConnect(streamId uint32, command string) {
+	if !c.config.EnableTwisp {
+		c.sendClosePacket(streamId, closeReasonBlocked)
+		return
+	}
+	if !c.isV2 {
+		c.repAddSource("twispNoAuth")
+		c.config.Logger.Warn("twisp blocked", "reason", "v1_no_auth", "ip", c.remoteIP)
+		c.sendClosePacket(streamId, closeReasonBlocked)
+		return
+	}
+	if !c.config.PasswordAuth {
+		c.repAddSource("twispNoAuth")
+		c.config.Logger.Warn("twisp blocked", "reason", "no_auth_configured", "ip", c.remoteIP)
+		c.sendClosePacket(streamId, closeReasonBlocked)
+		return
+	}
+	if !c.twispAuthorized() {
+		c.repAddSource("twispNoAuth")
+		c.config.Logger.Warn("twisp blocked", "reason", "not_authenticated", "ip", c.remoteIP)
+		c.sendClosePacket(streamId, closeReasonBlocked)
+		return
+	}
+	go handleTwisp(c, streamId, command)
+}
+
+func (c *wispConnection) violation(reason string) {
+	if c.config.FloodProtection == nil || c.config.FloodProtection.WsCloseAfterViolations <= 0 {
+		return
+	}
+	n := c.violations.Add(1)
+	if n >= int32(c.config.FloodProtection.WsCloseAfterViolations) {
+		c.config.Logger.Warn("ws closed for violations", "ip", c.remoteIP, "violations", n, "lastReason", reason)
+		c.close()
+	}
+}
+
+func (c *wispConnection) repAddSource(reason string) {
+	if c.globals != nil && c.globals.Reputation != nil {
+		c.globals.Reputation.AddSource(c.remoteIP, reason)
+	}
+}
+
+func (c *wispConnection) repAddDest(ip string, port int, reason string) {
+	if c.globals != nil && c.globals.Reputation != nil {
+		c.globals.Reputation.AddDest(ip, port, reason, net.ParseIP(c.remoteIP))
+	}
 }
 
 func (c *wispConnection) handleDataPacket(streamId uint32, payload []byte) {
@@ -319,6 +393,14 @@ func (c *wispConnection) deleteAllWispStreams() {
 		c.twispStreams.mu.Unlock()
 		for _, ts := range streams {
 			ts.close(closeReasonUnspecified)
+		}
+	}
+	if c.globals != nil {
+		if c.globals.Connections != nil {
+			c.globals.Connections.Release()
+		}
+		if c.globals.Signature != nil {
+			c.globals.Signature.Forget(c.connID)
 		}
 	}
 	defer func() { recover() }()
