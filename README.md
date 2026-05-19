@@ -244,6 +244,50 @@ Copy `example.config.json` to `config.json` and edit as needed:
 | `certAuthPublicKeys`         | []string | Allowed Ed25519 public keys (hex-encoded)     |
 | `enableStreamConfirm`        | bool     | Send confirmation when streams connect        |
 
+### Flood protection & egress
+
+mrrowisp now ships with default-deny SSRF protection and per-destination rate limiting to prevent the server from being abused as a TCP SYN flood relay (see OVH abuse reports referenced in `docs/superpowers/specs/`). The defaults are appropriate for a public proxy; tune `floodProtection` and `egress` to suit your deployment.
+
+**Behavior change in this version:** by default the server **refuses** outbound connections to private/loopback/link-local IP ranges (RFC1918, 127/8, 169.254/16, ::1, fc00::/7, fe80::/10). To allow them, either set `egress.allowPrivate: true` or list specific CIDRs in `egress.allowCIDRs`.
+
+**Reputation:** the server tracks a 0–100 score per source IP and per destination `ip:port`. Bad behavior (egress violations, SYN-flood signatures, twisp without auth, repeated burst-rate hits) raises the score; long-lived successful streams lower it. When a destination's score reaches `thresholds.strict` (default 81) — which happens when many distinct sources hit the same target — new CONNECTs to it are refused. The store is persisted to `reputation.storePath` and survives restarts.
+
+**Structured logging:** every block emits a single-line JSON record on stderr. Pipe to fail2ban or a log aggregator. Example fail2ban regex:
+
+```
+failregex = "event":"flood_block".*"srcIP":"<HOST>"
+```
+
+| Option                                                         | Default              | Description                               |
+| -------------------------------------------------------------- | -------------------- | ----------------------------------------- |
+| `maxPayloadBytes`                                              | 1048576              | Hard cap on a single WS frame payload     |
+| `trustedProxies`                                               | `[]`                 | CIDRs whose forwarded headers are honored |
+| `trustedHeaders`                                               | CF-Connecting-IP, XFF | Headers consulted when peer is trusted   |
+| `floodProtection.maxConnectsPerSourceIPPerSecond`              | 50                   | Per-source-IP CONNECT rate                |
+| `floodProtection.maxConnectsPerDestPerSecond`                  | 8                    | Per-destination-IP:port CONNECT rate      |
+| `floodProtection.maxConnectsPerDestPerMinute`                  | 60                   | Same destination, longer window           |
+| `floodProtection.maxInFlightSyns`                              | 256                  | Cap on concurrent unfinished dials        |
+| `floodProtection.maxConcurrentStreamsPerConnection`            | 256                  | Cap on concurrent streams per WS          |
+| `floodProtection.maxConcurrentConnections`                     | 1024                 | Cap on concurrent WS connections          |
+| `floodProtection.synFloodSignature.enabled`                    | true                 | Detect SYN-only outbound bursts           |
+| `floodProtection.synFloodSignature.windowMs`                   | 2000                 | Detection window                          |
+| `floodProtection.synFloodSignature.minSamples`                 | 32                   | Min dials in window before detection      |
+| `floodProtection.synFloodSignature.failedHandshakeRatio`       | 0.75                 | Failed-handshake fraction that triggers   |
+| `floodProtection.wsCloseAfterViolations`                       | 16                   | Close WS after this many enforcement hits |
+| `egress.allowPrivate`                                          | false                | Allow private/loopback/link-local IPs     |
+| `egress.allowIPs` / `egress.allowCIDRs`                        | `[]`                 | Explicit allow overrides                  |
+| `egress.denyIPs` / `egress.denyCIDRs`                          | `[]`                 | Explicit deny (highest priority)          |
+| `reputation.enabled`                                           | true                 | Track source/dest reputation              |
+| `reputation.storePath`                                         | ./data/mrrowisp-reputation.json | Persistence file              |
+| `reputation.scoreDecayPerHour`                                 | 1                    | Score decay rate                          |
+| `reputation.thresholds.warn`/`throttle`/`strict`               | 21 / 51 / 81         | Tier breakpoints                          |
+
+### Twisp authentication
+
+Twisp (terminal over wisp) now requires authentication. With `enableTwisp: true`, you must also enable at least one of `passwordAuth` or `certAuth`, and the requesting client must complete the v2 handshake successfully before a terminal stream is granted. Anonymous twisp on v1 has been removed.
+
+**Plaintext passwords are deprecated.** `passwordUsers` may also contain bcrypt hashes (prefix `$2a$` / `$2b$` / `$2y$`); generate them with any standard bcrypt tool. Plaintext entries still work but log a deprecation warning on first use.
+
 ## Credits
  - [soap phia](https://github.com/soap-phia/) - writing most of this
  - [rebecca](https://github.com/rebeccaheartz69/) - greatly helping with implementing wisp v2 and extensions
