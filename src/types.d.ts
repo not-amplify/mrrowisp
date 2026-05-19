@@ -1,5 +1,42 @@
 import type { ChildProcess } from "child_process";
 
+export type FloodProtectionConfig = {
+	enabled?: boolean;
+	maxConnectsPerSourceIPPerSecond?: number;
+	maxConnectsPerDestPerSecond?: number;
+	maxConnectsPerDestPerMinute?: number;
+	maxInFlightSyns?: number;
+	maxConcurrentStreamsPerConnection?: number;
+	maxConcurrentConnections?: number;
+	synFloodSignature?: {
+		enabled?: boolean;
+		windowMs?: number;
+		minSamples?: number;
+		failedHandshakeRatio?: number;
+	};
+	wsCloseAfterViolations?: number;
+	logBlockedDials?: boolean;
+};
+
+export type ReputationConfig = {
+	enabled?: boolean;
+	storePath?: string;
+	saveIntervalSeconds?: number;
+	scoreDecayPerHour?: number;
+	evictAfterDays?: number;
+	thresholds?: { warn?: number; throttle?: number; strict?: number };
+	weights?: Record<string, number>;
+	destinationWeights?: Record<string, number>;
+};
+
+export type EgressConfig = {
+	allowPrivate?: boolean;
+	allowIPs?: string[];
+	allowCIDRs?: string[];
+	denyIPs?: string[];
+	denyCIDRs?: string[];
+};
+
 export type Config = {
 	port?: number;
 	disableUDP?: boolean;
@@ -7,6 +44,7 @@ export type Config = {
 	bufferRemainingLength?: number;
 	tcpNoDelay?: boolean;
 	websocketTcpNoDelay?: boolean;
+	maxPayloadBytes?: number;
 	blacklist?: {
 		hostnames: string[];
 		ports?: number[];
@@ -17,6 +55,8 @@ export type Config = {
 	};
 	proxy?: string;
 	websocketPermessageDeflate?: boolean;
+	dnsServers?: string[];
+	/** @deprecated use dnsServers */
 	dnsServer?: string[];
 	enableTwisp?: boolean;
 	enableV2: boolean;
@@ -30,6 +70,12 @@ export type Config = {
 	certAuthRequired?: boolean;
 	certAuthPublicKeys?: string[];
 	enableStreamConfirm?: boolean;
+	maxConnectsPerSecond?: number;
+	trustedProxies?: string[];
+	trustedHeaders?: string[];
+	floodProtection?: FloodProtectionConfig;
+	reputation?: ReputationConfig;
+	egress?: EgressConfig;
 };
 
 export type WispEvents = {
@@ -65,6 +111,12 @@ export type WispBuilder = {
 	whitelistPorts(ports: number[]): WispBuilder;
 	proxy(url: string): WispBuilder;
 	dns(servers: string | string[]): WispBuilder;
+	trustedProxies(cidrs: string[]): WispBuilder;
+	trustedHeaders(headers: string[]): WispBuilder;
+	maxPayloadBytes(bytes: number): WispBuilder;
+	floodProtection(cfg: FloodProtectionConfig): WispBuilder;
+	reputation(cfg: ReputationConfig): WispBuilder;
+	egress(cfg: EgressConfig): WispBuilder;
 	route(req: IncomingMessage, socket: Socket, head: Buffer): void;
 	onReady(callback: () => void): WispBuilder;
 	onError(callback: (error: Error) => void): WispBuilder;

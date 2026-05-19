@@ -1,9 +1,19 @@
 import { spawn, type ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as net from "net";
+import * as os from "os";
+import * as path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { wispConfigPath, wispPath } from "../path.js";
-import type { Config, WispBuilder, WispEvents, WispServer, RouteRequest } from "../types.js";
+import type {
+	Config,
+	WispBuilder,
+	WispEvents,
+	WispServer,
+	FloodProtectionConfig,
+	ReputationConfig,
+	EgressConfig,
+} from "../types.js";
 import type { IncomingMessage } from "http";
 
 type EventListeners = {
@@ -91,13 +101,14 @@ class WispBuilderImpl implements WispBuilder {
 		stdout: [],
 		stderr: [],
 	};
+	private wss?: WebSocketServer;
 
 	constructor() {
 		this.config = JSON.parse(fs.readFileSync(wispConfigPath, "utf-8"));
 	}
 
-	fromFile(path: string): WispBuilder {
-		const fileConfig = JSON.parse(fs.readFileSync(path, "utf-8"));
+	fromFile(filePath: string): WispBuilder {
+		const fileConfig = JSON.parse(fs.readFileSync(filePath, "utf-8"));
 		this.config = { ...this.config, ...fileConfig };
 		return this;
 	}
@@ -149,12 +160,20 @@ class WispBuilderImpl implements WispBuilder {
 	}
 
 	blacklistPorts(ports: number[]): WispBuilder {
-		this.config.blacklist = { ...this.config.blacklist, ports };
+		this.config.blacklist = {
+			hostnames: this.config.blacklist?.hostnames ?? [],
+			...this.config.blacklist,
+			ports,
+		};
 		return this;
 	}
 
 	whitelistPorts(ports: number[]): WispBuilder {
-		this.config.whitelist = { ...this.config.whitelist, ports };
+		this.config.whitelist = {
+			hostnames: this.config.whitelist?.hostnames ?? [],
+			...this.config.whitelist,
+			ports,
+		};
 		return this;
 	}
 
@@ -164,13 +183,46 @@ class WispBuilderImpl implements WispBuilder {
 	}
 
 	dns(servers: string | string[]): WispBuilder {
-		this.config.dnsServer = Array.isArray(servers) ? servers : [servers];
+		this.config.dnsServers = Array.isArray(servers) ? servers : [servers];
+		return this;
+	}
+
+	trustedProxies(cidrs: string[]): WispBuilder {
+		this.config.trustedProxies = cidrs;
+		return this;
+	}
+
+	trustedHeaders(headers: string[]): WispBuilder {
+		this.config.trustedHeaders = headers;
+		return this;
+	}
+
+	maxPayloadBytes(bytes: number): WispBuilder {
+		this.config.maxPayloadBytes = bytes;
+		return this;
+	}
+
+	floodProtection(cfg: FloodProtectionConfig): WispBuilder {
+		this.config.floodProtection = { ...this.config.floodProtection, ...cfg };
+		return this;
+	}
+
+	reputation(cfg: ReputationConfig): WispBuilder {
+		this.config.reputation = { ...this.config.reputation, ...cfg };
+		return this;
+	}
+
+	egress(cfg: EgressConfig): WispBuilder {
+		this.config.egress = { ...this.config.egress, ...cfg };
 		return this;
 	}
 
 	route(req: IncomingMessage, socket: net.Socket, head: Buffer): void {
 		const port = this.config.port ?? 8080;
-		const wss = new WebSocketServer({ noServer: true });
+		if (!this.wss) {
+			this.wss = new WebSocketServer({ noServer: true });
+		}
+		const wss = this.wss;
 
 		wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {
 			const client = new WebSocket(`ws://localhost:${port}`);
@@ -181,14 +233,8 @@ class WispBuilderImpl implements WispBuilder {
 						client.send(data);
 					}
 				});
-
-				ws.on("close", () => {
-					client.close();
-				});
-
-				ws.on("error", () => {
-					client.close();
-				});
+				ws.on("close", () => client.close());
+				ws.on("error", () => client.close());
 			});
 
 			client.on("message", (data: Buffer) => {
@@ -197,17 +243,12 @@ class WispBuilderImpl implements WispBuilder {
 				}
 			});
 
-			client.on("close", () => {
-				ws.close();
-			});
-
-			client.on("error", (err) => {
-				ws.close(1011, err.message);
-			});
+			client.on("close", () => ws.close());
+			client.on("error", (err) => ws.close(1011, err.message));
 		});
 
 		socket.on("error", () => {
-			wss.close();
+			/* keep wss alive across requests */
 		});
 	}
 
@@ -244,11 +285,24 @@ class WispBuilderImpl implements WispBuilder {
 		return new Promise((resolve, reject) => {
 			let resolved = false;
 
-			const process = spawn(wispPath, ["--config", JSON.stringify(this.config)]);
+			// Write config to a private temp file rather than passing on argv.
+			// Passing JSON on argv exposes secrets via /proc/*/cmdline.
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mrrowisp-"));
+			const cfgPath = path.join(dir, "config.json");
+			fs.writeFileSync(cfgPath, JSON.stringify(this.config), { mode: 0o600 });
 
-			const server = new WispServerImpl(process, this.config, this.listeners);
+			const cleanup = () => {
+				try {
+					fs.rmSync(dir, { recursive: true, force: true });
+				} catch {
+					/* ignore */
+				}
+			};
 
-			process.stdout.on("data", (data: Buffer) => {
+			const child = spawn(wispPath, ["--config", cfgPath]);
+			const server = new WispServerImpl(child, this.config, this.listeners);
+
+			child.stdout.on("data", (data: Buffer) => {
 				const str = data.toString();
 				this.listeners.stdout.forEach((cb) => cb(str));
 
@@ -259,12 +313,13 @@ class WispBuilderImpl implements WispBuilder {
 				}
 			});
 
-			process.stderr.on("data", (data: Buffer) => {
+			child.stderr.on("data", (data: Buffer) => {
 				const str = data.toString();
 				this.listeners.stderr.forEach((cb) => cb(str));
 			});
 
-			process.on("error", (err) => {
+			child.on("error", (err) => {
+				cleanup();
 				if (!resolved) {
 					resolved = true;
 					this.listeners.error.forEach((cb) => cb(err));
@@ -272,7 +327,8 @@ class WispBuilderImpl implements WispBuilder {
 				}
 			});
 
-			process.on("exit", (code, signal) => {
+			child.on("exit", (code, signal) => {
+				cleanup();
 				if (!resolved) {
 					resolved = true;
 					const err = new Error(`Server exited before ready (code: ${code}, signal: ${signal})`);
@@ -286,7 +342,8 @@ class WispBuilderImpl implements WispBuilder {
 					resolved = true;
 					const err = new Error("Server startup timed out after 10 seconds");
 					this.listeners.error.forEach((cb) => cb(err));
-					process.kill("SIGKILL");
+					child.kill("SIGKILL");
+					cleanup();
 					reject(err);
 				}
 			}, 10000);
