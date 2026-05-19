@@ -47,6 +47,8 @@ type writeReq struct {
 	pool bool
 }
 
+var connIDCounter uint64
+
 type wispConnection struct {
 	netConn        net.Conn
 	writeCh        chan writeReq
@@ -57,6 +59,14 @@ type wispConnection struct {
 	config         *Config
 	twispStreams   *twispRegistry
 	connectLimiter *connectRateLimiter
+
+	globals     *Globals
+	srcIP       net.IP
+	connID      uint64
+	violations  atomic.Int32
+	streamCount atomic.Int32
+
+	authPassedFlag atomic.Bool
 
 	isV2          bool
 	handshakeDone chan struct{}
@@ -150,23 +160,42 @@ func (c *wispConnection) handlePacket(packetType uint8, streamId uint32, payload
 
 func (c *wispConnection) handleConnectPacket(streamId uint32, payload []byte) {
 	if !c.connectLimiter.allow() {
+		c.violation("per_ws_rate")
 		c.sendClosePacket(streamId, closeReasonThrottled)
 		return
 	}
-
 	if len(payload) < 3 {
 		return
 	}
 	streamType := payload[0]
-	port := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(payload[1:3])), 10)
+	portNum := int(binary.LittleEndian.Uint16(payload[1:3]))
+	port := strconv.Itoa(portNum)
 	hostname := string(payload[3:])
 
-	if streamType == streamTypeTerm {
-		if !c.config.EnableTwisp {
-			c.sendClosePacket(streamId, closeReasonBlocked)
+	srcKey := ""
+	if c.srcIP != nil {
+		srcKey = c.srcIP.String()
+	}
+
+	// Per-connection concurrent stream cap.
+	if c.config.FloodProtection != nil && c.config.FloodProtection.MaxConcurrentStreamsPerConnection > 0 {
+		if c.streamCount.Load() >= int32(c.config.FloodProtection.MaxConcurrentStreamsPerConnection) {
+			c.violation("per_ws_streams")
+			c.sendClosePacket(streamId, closeReasonThrottled)
 			return
 		}
-		go handleTwisp(c, streamId, hostname)
+	}
+
+	// Per-source IP rate.
+	if c.globals != nil && c.globals.PerSource != nil && !c.globals.PerSource.Allow(srcKey) {
+		c.violation("per_source_rate")
+		c.repAddSource("burstRate")
+		c.sendClosePacket(streamId, closeReasonThrottled)
+		return
+	}
+
+	if streamType == streamTypeTerm {
+		c.handleTwispConnect(streamId, hostname)
 		return
 	}
 
@@ -175,6 +204,7 @@ func (c *wispConnection) handleConnectPacket(streamId uint32, payload []byte) {
 		streamId:  streamId,
 		connReady: make(chan struct{}),
 		hostname:  strings.ToLower(strings.TrimSpace(hostname)),
+		port:      portNum,
 	}
 	stream.isOpen.Store(true)
 
@@ -183,7 +213,76 @@ func (c *wispConnection) handleConnectPacket(streamId uint32, payload []byte) {
 		return
 	}
 
+	c.streamCount.Add(1)
 	go stream.handleConnect(streamType, port, hostname)
+}
+
+// handleTwispConnect gates terminal-stream requests. Twisp is enabled only
+// when (a) the config explicitly opts in, (b) v2 is in use, (c) auth is
+// configured AND (d) the client passed auth.
+func (c *wispConnection) handleTwispConnect(streamId uint32, command string) {
+	if !c.config.EnableTwisp {
+		c.sendClosePacket(streamId, closeReasonBlocked)
+		return
+	}
+	srcKey := ""
+	if c.srcIP != nil {
+		srcKey = c.srcIP.String()
+	}
+	if !c.isV2 {
+		c.repAddSource("twispNoAuth")
+		logEvent("twisp_blocked", map[string]any{"srcIP": srcKey, "reason": "v1_no_auth"})
+		c.sendClosePacket(streamId, closeReasonBlocked)
+		return
+	}
+	if !c.config.PasswordAuth && !c.config.CertAuth {
+		c.repAddSource("twispNoAuth")
+		logEvent("twisp_blocked", map[string]any{"srcIP": srcKey, "reason": "no_auth_configured"})
+		c.sendClosePacket(streamId, closeReasonBlocked)
+		return
+	}
+	if !c.authPassed() {
+		c.repAddSource("twispNoAuth")
+		logEvent("twisp_blocked", map[string]any{"srcIP": srcKey, "reason": "not_authenticated"})
+		c.sendClosePacket(streamId, closeReasonBlocked)
+		return
+	}
+	go handleTwisp(c, streamId, command)
+}
+
+func (c *wispConnection) violation(reason string) {
+	if c.config.FloodProtection == nil || c.config.FloodProtection.WsCloseAfterViolations <= 0 {
+		return
+	}
+	n := c.violations.Add(1)
+	if n >= int32(c.config.FloodProtection.WsCloseAfterViolations) {
+		srcKey := ""
+		if c.srcIP != nil {
+			srcKey = c.srcIP.String()
+		}
+		logEvent("ws_close_for_violations", map[string]any{
+			"srcIP": srcKey, "violations": n, "lastReason": reason,
+		})
+		c.close()
+	}
+}
+
+func (c *wispConnection) repAddSource(reason string) {
+	if c.globals != nil && c.globals.Reputation != nil && c.srcIP != nil {
+		c.globals.Reputation.AddSource(c.srcIP.String(), reason)
+	}
+}
+
+func (c *wispConnection) repAddDest(ip string, port int, reason string) {
+	if c.globals != nil && c.globals.Reputation != nil {
+		c.globals.Reputation.AddDest(ip, port, reason, c.srcIP)
+	}
+}
+
+// authPassed returns whether v2 auth has been completed for this WS.
+// Always returns false on v1 (no auth concept). Set in handleInfo.
+func (c *wispConnection) authPassed() bool {
+	return c.authPassedFlag.Load()
 }
 
 func (c *wispConnection) handleDataPacket(streamId uint32, payload []byte) {
@@ -332,4 +431,13 @@ func (c *wispConnection) deleteAllWispStreams() {
 		// queueWrite would race with the close. They observe writeDone and
 		// exit; the channel becomes garbage once references drop.
 	})
+
+	if c.globals != nil {
+		if c.globals.Connections != nil {
+			c.globals.Connections.Release()
+		}
+		if c.globals.Signature != nil {
+			c.globals.Signature.Forget(c.connID)
+		}
+	}
 }

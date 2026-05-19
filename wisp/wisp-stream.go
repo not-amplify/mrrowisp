@@ -19,6 +19,7 @@ type wispStream struct {
 	conn            net.Conn
 	bufferRemaining uint32
 	hostname        string
+	port            int
 
 	connReady     chan struct{}
 	connReadyDone atomic.Bool
@@ -31,8 +32,10 @@ type wispStream struct {
 
 func (s *wispStream) handleConnect(streamType uint8, port string, hostname string) {
 	defer s.signalConnReady()
+	defer s.wispConn.streamCount.Add(-1)
 
 	cfg := s.wispConn.config
+	c := s.wispConn
 	s.hostname = strings.ToLower(strings.TrimSpace(hostname))
 
 	if len(cfg.Whitelist.Hostnames) > 0 {
@@ -59,26 +62,117 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 		}
 	}
 
-	resolvedHostname := hostname
-	if cfg.DNSCache != nil {
+	srcKey := ""
+	if c.srcIP != nil {
+		srcKey = c.srcIP.String()
+	}
+
+	// Resolve to a single IP. Egress policy is applied to every candidate.
+	resolvedIP := ""
+	if ip := net.ParseIP(hostname); ip != nil {
+		// IP literal: skip DNS but enforce egress.
+		if ok, reason := egressEvaluate(c.globals, ip); !ok {
+			c.repAddSource("privateEgress")
+			c.repAddDest(ip.String(), s.port, "privateEgress")
+			logEvent("egress_block", map[string]any{
+				"srcIP": srcKey, "dstIP": ip.String(), "dstPort": s.port, "reason": reason,
+			})
+			s.close(closeReasonBlocked)
+			return
+		}
+		resolvedIP = ip.String()
+	} else if cfg.DNSCache != nil {
 		if _, whitelisted := cfg.Whitelist.Hostnames[hostname]; !whitelisted {
 			ips, err := cfg.DNSCache.LookupIPAddr(context.Background(), hostname)
-			if err != nil {
+			if err != nil || len(ips) == 0 {
 				s.close(closeReasonUnreachable)
 				return
 			}
-			if len(ips) == 0 {
-				s.close(closeReasonUnreachable)
+			lastReason := ""
+			for _, ip := range ips {
+				ok, reason := egressEvaluate(c.globals, ip.IP)
+				if ok {
+					resolvedIP = ip.IP.String()
+					break
+				}
+				lastReason = reason
+			}
+			if resolvedIP == "" {
+				c.repAddSource("privateEgress")
+				logEvent("egress_block", map[string]any{
+					"srcIP": srcKey, "host": hostname, "dstPort": s.port, "reason": lastReason,
+				})
+				s.close(closeReasonBlocked)
 				return
 			}
-			resolvedHostname = ips[0].IP.String()
+		} else {
+			resolvedIP = hostname
 		}
+	} else {
+		resolvedIP = hostname
+	}
+
+	dstKey := net.JoinHostPort(resolvedIP, port)
+
+	// Per-destination rate limits.
+	if c.globals != nil {
+		if c.globals.PerDestSec != nil && !c.globals.PerDestSec.Allow(dstKey) {
+			c.violation("per_dest_sec")
+			c.repAddSource("burstRate")
+			c.repAddDest(resolvedIP, s.port, "burstRate")
+			logEvent("flood_block", map[string]any{
+				"srcIP": srcKey, "dstIP": resolvedIP, "dstPort": s.port,
+				"streamId": s.streamId, "reason": "per_dest_sec",
+			})
+			s.close(closeReasonThrottled)
+			return
+		}
+		if c.globals.PerDestMin != nil && !c.globals.PerDestMin.Allow(dstKey) {
+			c.violation("per_dest_min")
+			logEvent("flood_block", map[string]any{
+				"srcIP": srcKey, "dstIP": resolvedIP, "dstPort": s.port,
+				"streamId": s.streamId, "reason": "per_dest_min",
+			})
+			s.close(closeReasonThrottled)
+			return
+		}
+	}
+
+	// Reputation-strict destination check: if the destination is already
+	// flagged as strict (lots of distinct sources / SYN signatures), refuse
+	// and softly bump the requesting source.
+	if c.globals != nil && c.globals.Reputation != nil {
+		ds := c.globals.Reputation.DestScore(resolvedIP, s.port)
+		if c.globals.Reputation.Tier(ds) == TierStrict {
+			c.repAddSource("requestKnownBadDest")
+			logEvent("flood_block", map[string]any{
+				"srcIP": srcKey, "dstIP": resolvedIP, "dstPort": s.port,
+				"streamId": s.streamId, "reason": "dest_reputation_strict",
+			})
+			s.close(closeReasonBlocked)
+			return
+		}
+	}
+
+	// In-flight SYN cap: hold for the lifetime of the dial only.
+	synAcquired := false
+	if c.globals != nil && c.globals.InFlightSyns != nil && streamType == streamTypeTCP {
+		if !c.globals.InFlightSyns.TryAcquire() {
+			c.violation("in_flight_syns")
+			logEvent("flood_block", map[string]any{
+				"srcIP": srcKey, "dstIP": resolvedIP, "dstPort": s.port,
+				"streamId": s.streamId, "reason": "in_flight_syns",
+			})
+			s.close(closeReasonThrottled)
+			return
+		}
+		synAcquired = true
 	}
 
 	s.streamType = streamType
 	s.bufferRemaining = cfg.BufferRemainingLength
 
-	destination := net.JoinHostPort(resolvedHostname, port)
+	destination := net.JoinHostPort(resolvedIP, port)
 
 	var err error
 	switch streamType {
@@ -86,6 +180,9 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 		if cfg.Proxy != "" {
 			dialer, proxyErr := proxy.SOCKS5("tcp", cfg.Proxy, nil, proxy.Direct)
 			if proxyErr != nil {
+				if synAcquired {
+					c.globals.InFlightSyns.Release()
+				}
 				s.close(closeReasonNetworkError)
 				return
 			}
@@ -95,13 +192,42 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 		}
 	case streamTypeUDP:
 		if cfg.DisableUDP || cfg.Proxy != "" {
+			if synAcquired {
+				c.globals.InFlightSyns.Release()
+			}
 			s.close(closeReasonBlocked)
 			return
 		}
 		s.conn, err = net.Dial("udp", destination)
 	default:
+		if synAcquired {
+			c.globals.InFlightSyns.Release()
+		}
 		s.close(closeReasonInvalidInfo)
 		return
+	}
+
+	if synAcquired {
+		c.globals.InFlightSyns.Release()
+	}
+
+	// Record dial outcome and check SYN-flood signature.
+	if c.globals != nil && c.globals.Signature != nil && streamType == streamTypeTCP {
+		det := c.globals.Signature.For(c.connID, resolvedIP, s.port)
+		det.Record(err == nil)
+		if det.Match() {
+			c.repAddSource("synSignature")
+			c.repAddDest(resolvedIP, s.port, "synSignature")
+			logEvent("syn_signature", map[string]any{
+				"srcIP": srcKey, "dstIP": resolvedIP, "dstPort": s.port, "streamId": s.streamId,
+			})
+			if err == nil && s.conn != nil {
+				s.conn.Close()
+			}
+			s.close(closeReasonBlocked)
+			c.close()
+			return
+		}
 	}
 
 	if err != nil {
@@ -138,6 +264,14 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 	}
 
 	s.readFromConnection()
+}
+
+// egressEvaluate is a nil-safe wrapper around EgressPolicy.Evaluate.
+func egressEvaluate(g *Globals, ip net.IP) (bool, string) {
+	if g == nil || g.Egress == nil {
+		return true, ""
+	}
+	return g.Egress.Evaluate(ip)
 }
 
 func (s *wispStream) signalConnReady() {

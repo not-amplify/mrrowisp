@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lxzan/gws"
@@ -50,7 +51,10 @@ type Config struct {
 	TrustedProxies []*net.IPNet
 	TrustedHeaders []string
 
-	Egress *EgressPolicy
+	Egress          *EgressPolicy
+	FloodProtection *FloodProtectionConfig
+	Reputation      *ReputationConfig
+	Globals         *Globals
 
 	DNSCache    *DNSCache
 	ReadBufPool sync.Pool
@@ -73,6 +77,63 @@ func (c *Config) InitResolver() {
 	c.DNSCache = NewDNSCache(c.DnsServers)
 }
 
+// FloodProtectionConfig groups every flood-mitigation knob.
+type FloodProtectionConfig struct {
+	Enabled                           bool
+	MaxConnectsPerSourceIPPerSecond   int
+	MaxConnectsPerDestPerSecond       int
+	MaxConnectsPerDestPerMinute       int
+	MaxInFlightSyns                   int
+	MaxConcurrentStreamsPerConnection int
+	MaxConcurrentConnections          int
+	SynFloodSignature                 struct {
+		Enabled              bool
+		WindowMs             int
+		MinSamples           int
+		FailedHandshakeRatio float64
+	}
+	WsCloseAfterViolations int
+	LogBlockedDials        bool
+}
+
+// BuildGlobals constructs the process-wide enforcement state from c.
+// Idempotent: a non-nil c.Globals is left as-is.
+func (c *Config) BuildGlobals() {
+	if c.Globals != nil {
+		return
+	}
+	g := &Globals{Egress: c.Egress}
+	if c.FloodProtection != nil && c.FloodProtection.Enabled {
+		fp := c.FloodProtection
+		if fp.MaxConnectsPerSourceIPPerSecond > 0 {
+			g.PerSource = NewSlidingWindow(fp.MaxConnectsPerSourceIPPerSecond, time.Second)
+		}
+		if fp.MaxConnectsPerDestPerSecond > 0 {
+			g.PerDestSec = NewSlidingWindow(fp.MaxConnectsPerDestPerSecond, time.Second)
+		}
+		if fp.MaxConnectsPerDestPerMinute > 0 {
+			g.PerDestMin = NewSlidingWindow(fp.MaxConnectsPerDestPerMinute, time.Minute)
+		}
+		if fp.MaxInFlightSyns > 0 {
+			g.InFlightSyns = NewSemaphore(fp.MaxInFlightSyns)
+		}
+		if fp.MaxConcurrentConnections > 0 {
+			g.Connections = NewSemaphore(fp.MaxConcurrentConnections)
+		}
+		g.Signature = NewSignatures(SignatureConfig{
+			Enabled:              fp.SynFloodSignature.Enabled,
+			Window:               time.Duration(fp.SynFloodSignature.WindowMs) * time.Millisecond,
+			MinSamples:           fp.SynFloodSignature.MinSamples,
+			FailedHandshakeRatio: fp.SynFloodSignature.FailedHandshakeRatio,
+		})
+	}
+	if c.Reputation != nil && c.Reputation.Enabled {
+		g.Reputation = NewReputation(*c.Reputation)
+		_ = g.Reputation.Load()
+	}
+	c.Globals = g
+}
+
 type upgradeHandler struct {
 	gws.BuiltinEventHandler
 }
@@ -86,6 +147,7 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 	}
 
 	config.InitResolver()
+	config.BuildGlobals()
 
 	readBufSize := 15 + config.TcpBufferSize
 	config.ReadBufPool = sync.Pool{
@@ -107,10 +169,21 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 	})
 
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Cap concurrent WS connections before upgrade.
+		if config.Globals != nil && config.Globals.Connections != nil {
+			if !config.Globals.Connections.TryAcquire() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+		}
+
 		useV2 := config.EnableV2 && r.Header.Get("Sec-WebSocket-Protocol") != ""
 
 		wsConn, err := upgrader.Upgrade(w, r)
 		if err != nil {
+			if config.Globals != nil && config.Globals.Connections != nil {
+				config.Globals.Connections.Release()
+			}
 			return
 		}
 
@@ -124,6 +197,8 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 			tc.SetWriteBuffer(1 << 20)
 		}
 
+		srcIP := ResolveClientIP(r, config.TrustedProxies, config.TrustedHeaders)
+
 		wc := &wispConnection{
 			netConn:        netConn,
 			writeCh:        make(chan writeReq, 4096), // funny number
@@ -131,6 +206,9 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 			twispStreams:   newTwisp(),
 			isV2:           useV2,
 			connectLimiter: newConnectRateLimiter(config.MaxConnectsPerSecond),
+			globals:        config.Globals,
+			srcIP:          srcIP,
+			connID:         atomic.AddUint64(&connIDCounter, 1),
 		}
 		wc.initWriteLifecycle()
 
