@@ -49,8 +49,13 @@ type Config struct {
 	PasswordAuthRequired bool              `json:"passwordAuthRequired"`
 	PasswordUsers        map[string]string `json:"passwordUsers"`
 
-	ParseRealIP   bool   `json:"parseRealIP"`
-	NonWSResponse string `json:"nonWSResponse"`
+	ParseRealIP    bool     `json:"parseRealIP"`
+	TrustedProxies []string `json:"trustedProxies"`
+	TrustedHeaders []string `json:"trustedHeaders"`
+	NonWSResponse  string   `json:"nonWSResponse"`
+
+	// Parsed at construction; not user-visible JSON.
+	trustedProxyNets []*net.IPNet
 
 	LogLevel string `json:"logLevel"`
 
@@ -95,8 +100,10 @@ func DefaultConfig() Config {
 		PasswordAuthRequired: false,
 		PasswordUsers:        map[string]string{},
 
-		ParseRealIP:   true,
-		NonWSResponse: "",
+		ParseRealIP:    true,
+		TrustedProxies: []string{},
+		TrustedHeaders: []string{"CF-Connecting-IP", "X-Forwarded-For"},
+		NonWSResponse:  "",
 
 		LogLevel: "info",
 
@@ -137,8 +144,10 @@ func CreateWispConfig(cfg *Config) *Config {
 		PasswordAuthRequired: cfg.PasswordAuthRequired,
 		PasswordUsers:        cfg.PasswordUsers,
 
-		ParseRealIP:   cfg.ParseRealIP,
-		NonWSResponse: cfg.NonWSResponse,
+		ParseRealIP:    cfg.ParseRealIP,
+		TrustedProxies: cfg.TrustedProxies,
+		TrustedHeaders: cfg.TrustedHeaders,
+		NonWSResponse:  cfg.NonWSResponse,
 
 		LogLevel: cfg.LogLevel,
 

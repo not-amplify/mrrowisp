@@ -1,8 +1,10 @@
 package wisp
 
 import (
+	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +27,23 @@ func (cfg *Config) InitResolver() {
 			ResultOrder: cfg.DnsResultOrder,
 		})
 	cfg.Logger = newLogger(cfg.LogLevel)
+
+	cfg.trustedProxyNets = cfg.trustedProxyNets[:0]
+	for _, t := range cfg.TrustedProxies {
+		entry := t
+		if !strings.Contains(entry, "/") {
+			if ip := net.ParseIP(entry); ip != nil {
+				bits := 32
+				if ip.To4() == nil {
+					bits = 128
+				}
+				entry = fmt.Sprintf("%s/%d", entry, bits)
+			}
+		}
+		if _, n, err := net.ParseCIDR(entry); err == nil {
+			cfg.trustedProxyNets = append(cfg.trustedProxyNets, n)
+		}
+	}
 }
 
 type upgradeHandler struct {
@@ -68,12 +87,19 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 			tc.SetWriteBuffer(1 << 20)
 		}
 
+		var trusted []*net.IPNet
+		if config.ParseRealIP {
+			trusted = config.trustedProxyNets
+		}
+		remoteIP := ResolveClientIP(r, trusted, config.TrustedHeaders)
+
 		wc := &wispConnection{
 			netConn:      netConn,
 			writeCh:      make(chan writeReq, 4096), // funny number
 			config:       config,
 			twispStreams: newTwisp(),
 			isV2:         useV2,
+			remoteIP:     remoteIP.String(),
 		}
 
 		go wc.writeLoop()
