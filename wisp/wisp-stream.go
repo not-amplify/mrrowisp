@@ -57,8 +57,22 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 		}
 	}
 
+	policy := PolicyFromConfig(cfg)
+
 	resolvedHostname := hostname
-	if cfg.DNSCache != nil {
+	if ip := net.ParseIP(hostname); ip != nil {
+		if !cfg.AllowDirectIP {
+			cfg.Logger.Warn("egress block: direct IP", "ip", s.wispConn.remoteIP, "dstIP", ip.String(), "port", port)
+			s.close(closeReasonBlocked)
+			return
+		}
+		if ok, reason := policy.Evaluate(ip); !ok {
+			cfg.Logger.Warn("egress block", "ip", s.wispConn.remoteIP, "dstIP", ip.String(), "port", port, "reason", reason)
+			s.close(closeReasonBlocked)
+			return
+		}
+		resolvedHostname = ip.String()
+	} else if cfg.DNSCache != nil {
 		if _, whitelisted := cfg.Whitelist.Hostnames[hostname]; !whitelisted {
 			ips, err := cfg.DNSCache.LookupIPAddr(context.Background(), hostname)
 			if err != nil {
@@ -69,7 +83,21 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 				s.close(closeReasonUnreachable)
 				return
 			}
-			resolvedHostname = ips[0].IP.String()
+			pickedReason := ""
+			for _, ipa := range ips {
+				if ok, reason := policy.Evaluate(ipa.IP); ok {
+					resolvedHostname = ipa.IP.String()
+					pickedReason = ""
+					break
+				} else {
+					pickedReason = reason
+				}
+			}
+			if pickedReason != "" {
+				cfg.Logger.Warn("egress block", "ip", s.wispConn.remoteIP, "host", hostname, "port", port, "reason", pickedReason)
+				s.close(closeReasonBlocked)
+				return
+			}
 		}
 	}
 
