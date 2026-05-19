@@ -39,3 +39,27 @@ func TestCheckPasswordEmpty(t *testing.T) {
 		t.Fatal("x != empty")
 	}
 }
+
+func TestTwispGateNoAuth(t *testing.T) {
+	c := &wispConnection{
+		config: &Config{EnableTwisp: true, PasswordAuth: false, CertAuth: false},
+		isV2:   true,
+	}
+	if c.authPassed() {
+		t.Fatal("unauthenticated v2 should not pass")
+	}
+}
+
+func TestTwispGatePasswordAuthSet(t *testing.T) {
+	c := &wispConnection{
+		config: &Config{EnableTwisp: true, PasswordAuth: true},
+		isV2:   true,
+	}
+	if c.authPassed() {
+		t.Fatal("authPassed should default false")
+	}
+	c.authPassedFlag.Store(true)
+	if !c.authPassed() {
+		t.Fatal("expected true after store")
+	}
+}
