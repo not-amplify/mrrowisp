@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"encoding/binary"
 	"io"
-	"unsafe"
 )
 
 func (c *wispConnection) readLoop() {
@@ -45,6 +44,11 @@ func (c *wispConnection) readLoop() {
 			if _, err := io.ReadFull(reader, maskKey[:]); err != nil {
 				return
 			}
+		}
+
+		maxPayload := uint64(c.config.MaxPayloadBytes)
+		if maxPayload > 0 && payloadLen > maxPayload {
+			return
 		}
 
 		var payload []byte
@@ -125,29 +129,16 @@ func (c *wispConnection) handleWispFrame(packet []byte) {
 }
 
 func maskXOR(b []byte, key [4]byte) {
-	maskKey := *(*uint32)(unsafe.Pointer(&key[0]))
+	maskKey := binary.LittleEndian.Uint32(key[:])
 	key64 := uint64(maskKey)<<32 | uint64(maskKey)
-
-	for len(b) >= 64 {
-		p := unsafe.Pointer(&b[0])
-		*(*uint64)(p) ^= key64
-		*(*uint64)(unsafe.Add(p, 8)) ^= key64
-		*(*uint64)(unsafe.Add(p, 16)) ^= key64
-		*(*uint64)(unsafe.Add(p, 24)) ^= key64
-		*(*uint64)(unsafe.Add(p, 32)) ^= key64
-		*(*uint64)(unsafe.Add(p, 40)) ^= key64
-		*(*uint64)(unsafe.Add(p, 48)) ^= key64
-		*(*uint64)(unsafe.Add(p, 56)) ^= key64
-		b = b[64:]
+	i := 0
+	for ; i+8 <= len(b); i += 8 {
+		v := binary.LittleEndian.Uint64(b[i:])
+		v ^= key64
+		binary.LittleEndian.PutUint64(b[i:], v)
 	}
-
-	for len(b) >= 8 {
-		*(*uint64)(unsafe.Pointer(&b[0])) ^= key64
-		b = b[8:]
-	}
-
-	for i := range b {
-		b[i] ^= key[i&3]
+	for j := i; j < len(b); j++ {
+		b[j] ^= key[j&3]
 	}
 }
 

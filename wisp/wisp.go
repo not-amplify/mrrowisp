@@ -45,6 +45,8 @@ type Config struct {
 	EnableStreamConfirm  bool
 	MaxConnectsPerSecond int
 
+	MaxPayloadBytes int
+
 	DNSCache    *DNSCache
 	ReadBufPool sync.Pool
 	Dialer      net.Dialer
@@ -58,6 +60,7 @@ func DefaultConfig() *Config {
 		TcpNoDelay:            true,
 		WebsocketTcpNoDelay:   true,
 		PasswordUsers:         make(map[string]string),
+		MaxPayloadBytes:       1 << 20,
 	}
 }
 
@@ -70,6 +73,13 @@ type upgradeHandler struct {
 }
 
 func CreateWispHandler(config *Config) http.HandlerFunc {
+	if config.WebsocketPermessageDeflate {
+		panic("websocketPermessageDeflate is not supported by the hand-rolled WS reader; set it to false")
+	}
+	if config.MaxPayloadBytes <= 0 {
+		config.MaxPayloadBytes = 1 << 20
+	}
+
 	config.InitResolver()
 
 	readBufSize := 15 + config.TcpBufferSize
@@ -87,7 +97,7 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 
 	upgrader := gws.NewUpgrader(&upgradeHandler{}, &gws.ServerOption{
 		PermessageDeflate: gws.PermessageDeflate{
-			Enabled: config.WebsocketPermessageDeflate,
+			Enabled: false,
 		},
 	})
 
