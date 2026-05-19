@@ -47,6 +47,9 @@ type Config struct {
 
 	MaxPayloadBytes int
 
+	TrustedProxies []*net.IPNet
+	TrustedHeaders []string
+
 	DNSCache    *DNSCache
 	ReadBufPool sync.Pool
 	Dialer      net.Dialer
